@@ -1,3 +1,399 @@
+
+//#include <UIPEthernet.h>
+#include <PubSubClient.h>
+
+#include "description.h"
+
+EthernetClient ethClient;
+PubSubClient mqttClient;
+
+extern void call_detect();
+
+//uint8_t adc_buffer[ADC_BUFFER_SIZE] = {0};
+uint8_t adc_buffer_length = 0;
+
+//uint8_t dac_buffer[DAC_BUFFER_SIZE] = {0};
+//uint8_t dac_buffer_length = 0;
+// СОСТОЯНИЕ устойства. Устройиство может быть только в определенном состоянии
+// Переключение осуществляется команддой сервера, либо началом/окончание вызова
+uint8_t dv_state = DV_STATE_INIT;
+
+// Отлов прерываний от АЦП
+ISR(ADC_vect)
+{
+    static uint8_t value = 0;
+    if (dv_state == DV_STATE_UP_PHONE) {
+        //DEBUG("ISR");
+        if (adc_buffer_length < ADC_BUFFER_SIZE) {
+            value = ADCH;  // read 8 bit value from ADC
+            //adc_buffer[adc_buffer_length++] = value;
+        } else {
+            //DEBUG("ISR");
+            //mqttClient.publish("/dm/adc_sample", adc_buffer, adc_buffer_length, true);
+            adc_buffer_length = 0;
+        }
+    }
+}
+
+void publish_topic(char* topic, char *value)
+{
+    if (mqttClient.state() != MQTT_CONNECTED){
+        reconnect_mqtt();
+    }
+    mqttClient.publish(topic, value, true);
+}
+
+/*
+void dvPinOut(int pin)
+{
+    DDRB |= (1<<pin);       // устанавливаем вывод PB5 как выход
+}
+
+void dvPinLow(int pin)
+{
+    PORTB &= ~(1<<pin);
+}
+
+void dvPinHigh(int pin)
+{
+    PORTB |= (1<<pin);
+}
+*/
+
+void setup()
+{
+    Serial.begin(DEBUG_SERIAL_BOUDRATE);
+    while (!Serial) {
+        ; // wait for serial port to connect. Needed for native USB, on LEONARDO, MICRO, YUN, and other 32u4 based boards.
+    }
+
+//    dvPinOut(LED_MQTT_RECIVE);
+//    dvPinOut(CALL_DETECT_PIN);
+    pinMode(LED_MQTT_RECIVE, OUTPUT);
+    pinMode(CALL_DETECT_PIN, INPUT);
+
+    DEBUG(F("Start device"));
+
+    attachInterrupt (0, call_detect, CHANGE);
+
+    DEBUG(F("Settings mqtt"));
+    // setup mqtt client
+    mqttClient.setClient(ethClient);
+    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+    mqttClient.setCallback(callback_mqtt);
+
+    // Настраиваю прерывания для ADC
+    ADCSRA = 0;             // clear ADCSRA register
+    ADCSRB = 0;             // clear ADCSRB register
+    ADMUX |= (0 & 0x07);    // set A0 analog input pin
+    ADMUX |= (1 << REFS0);  // set reference voltage
+    ADMUX |= (1 << ADLAR);  // left align ADC value to 8 bits from ADCH register
+
+    ADCSRA |= (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // 9.6KHz
+
+    ADCSRA |= (1 << ADATE); // enable auto trigger
+    ADCSRA |= (1 << ADIE);  // enable interrupts when measurement complete
+    ADCSRA |= (1 << ADEN);  // enable ADC
+    ADCSRA |= (1 << ADSC);  // start ADC measurements
+}
+
+static const char STATE_NAME_CALL[] = "wait_call";
+static const char STATE_NAME_SEND_NOTIFY_CALL[] = "call";
+static const char STATE_NAME_WAIT_USER[] = "wait_user";
+static const char STATE_NAME_UP_PHONE[] = "up_phone";
+static const char STATE_NAME_DOWN_PHONE[] = "down_phone";
+static const char STATE_NAME_OPEN_DOR[] = "open_dor";
+
+void change_state_device()
+{
+    switch(dv_state) {
+        case DV_STATE_WAIT:
+            // Привожу все пины в исходное СОСТОЯНИЕ
+            //dvPinLow(LED_MQTT_RECIVE);
+            digitalWrite(LED_MQTT_RECIVE, LOW);
+            publish_topic(MQTT_TOPIC_PUB_DEVICE_STATE, STATE_NAME_CALL);
+            break;
+        // Отправка уведомления пользователю о вызове
+        case DV_STATE_CALL_SEND_NOTIFY:
+            publish_topic(MQTT_TOPIC_PUB_DEVICE_STATE, STATE_NAME_SEND_NOTIFY_CALL);
+            break;
+        // Пользователь подтвердил получение уведомления
+        case DV_STATE_WAIT_USER_ACTION:
+            publish_topic(MQTT_TOPIC_PUB_DEVICE_STATE, STATE_NAME_WAIT_USER);
+            break;
+        // Пользователь снял трубку
+        case DV_STATE_UP_PHONE:
+            publish_topic(MQTT_TOPIC_PUB_DEVICE_STATE, STATE_NAME_UP_PHONE);
+            //dvPinHigh(LED_MQTT_RECIVE);
+            digitalWrite(LED_MQTT_RECIVE, HIGH);
+            break;
+        // Пользователь кладет трубку
+        case DV_STATE_DOWN_PHONE:
+            publish_topic(MQTT_TOPIC_PUB_DEVICE_STATE, STATE_NAME_DOWN_PHONE);
+            //dvPinLow(LED_MQTT_RECIVE);
+            digitalWrite(LED_MQTT_RECIVE, LOW);
+            break;
+        case DV_STATE_OPEN_DOR:
+            publish_topic(MQTT_TOPIC_PUB_DEVICE_STATE, STATE_NAME_OPEN_DOR);
+            break;
+    }
+}
+
+void loop()
+{
+    static long previous_time = 0;
+    //DEBUG("LOOP");
+    if (mqttClient.state() != MQTT_CONNECTED) {
+        dv_state = DV_STATE_INIT;
+        reconnect_mqtt();
+        dv_state = DV_STATE_WAIT;
+
+        call_detect();
+    }
+    mqttClient.loop();
+
+
+    long current_time = millis();
+    if (current_time - previous_time > INTERVAL_STATE_CHANGE) {
+        previous_time = current_time;
+        change_state_device();
+    }
+
+
+
+}
+
+void call_detect()
+{
+    uint8_t is_call = 0;
+    // Смотрим, что событие произошло на интересующем нас пине
+    if ((is_call=digitalRead(CALL_DETECT_PIN)) > 0) {
+        // Если вызов только начался
+        if (dv_state == DV_STATE_WAIT) {
+            DEBUG(F("SET STATE CALL"));
+            dv_state = DV_STATE_CALL_SEND_NOTIFY;
+        }
+    // Если вызов закончился
+    } else {
+        dv_state = DV_STATE_WAIT;
+    }
+}
+
+
+
+
+
+
+/*
+
+#include <Arduino_FreeRTOS.h>
+
+// Определим две задачи для алгоритмов Blink и AnalogRead:
+void TaskBlink( void *pvParameters );
+void TaskAnalogRead( void *pvParameters );
+
+// Функция setup запустится один раз, когда Вы нажмете кнопку
+// сброса или подадите питание на плату.
+void setup() {
+    Serial.begin(115200);
+   // Теперь создадим две задачи, чтобы они работали независимо
+   // друг от друга:
+   xTaskCreate(
+      TaskBlink
+      ,  (const portCHAR *)"Blink"  // Это просто любое имя, удобное
+                                    // для чтения человеком.
+      ,  128                        // Размер стека задачи
+      ,  NULL
+      ,  2                          // Приоритет задачи.
+      ,  NULL );
+
+   xTaskCreate(
+      TaskAnalogRead
+      ,  (const portCHAR *) "AnalogRead"
+      ,  128                        // Этот размер стека может быть проверен
+                                    // и подстроен путем чтения Highwater.
+      ,  NULL
+      ,  1                          // Приоритет задачи.
+      ,  NULL );
+
+   // Теперь автоматически и неявно для пользователя запустится scheduler,
+   // который возьмет на себя управление планированием запуска отдельных задач.
+}
+
+void loop()
+{
+}
+
+
+void TaskBlink(void *pvParameters)
+{
+  (void) pvParameters;
+
+   // Инициализация цифрового вывода 13 в режиме выхода.
+   pinMode(8, OUTPUT);
+
+   for (;;) // A Task shall never return or exit.
+   {
+      digitalWrite(8, HIGH);    // включение светодиода LED
+      vTaskDelay( 1000 / portTICK_PERIOD_MS ); // ожидание в 1 секунду
+      digitalWrite(8, LOW);     // включение светодиода LED
+      vTaskDelay( 1000 / portTICK_PERIOD_MS ); // ожидание в 1 секунду
+   }
+}
+
+void TaskAnalogRead(void *pvParameters)
+{
+  (void) pvParameters;
+
+   // Инициализация последовательного обмена данными на скорости
+   // 9600 бит в секунду:
+
+
+   for (;;)
+   {
+      // Чтение входа аналогового вывода 0:
+      int sensorValue = analogRead(A0);
+      // Вывод на печать прочитанного значения:
+      DEBUG(sensorValue);
+      // Задержка в 1 тик (15 мс) между чтениями, для стабильности:
+      vTaskDelay(1);
+   }
+}
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+#include "description.h"
+#define CLIENT_ID       "UnoMQTT"
+#define INTERVAL        10 // 3 sec delay between publishing
+//#define DHTPIN          3
+//#define DHTTYPE         DHT11
+bool statusKD=HIGH;//living room door
+bool statusBD=HIGH;//front door
+bool statusGD=HIGH;//garage door
+int lichtstatus;
+uint8_t mac[6] = {0x00,0x01,0x02,0x03,0x04,0x05};
+
+EthernetClient ethClient;
+PubSubClient mqttClient;
+//DHT dht(DHTPIN, DHTTYPE);
+
+long previousMillis;
+
+void setup() {
+pinMode(4,INPUT_PULLUP);
+pinMode(5,INPUT_PULLUP);
+pinMode(6,INPUT_PULLUP);
+  // setup serial communication
+  Serial.begin(115200);
+
+  DEBUG("START");
+  // setup ethernet communication using DHCP
+  if(Ethernet.begin(mac) == 0) {
+    DEBUG(F("Ethernet configuration using DHCP failed"));
+    for(;;);
+  }
+  // setup mqtt client
+  mqttClient.setClient(ethClient);
+  mqttClient.setServer("192.168.0.102", 1883);
+  //mqttClient.setServer("192.168.1.xxx",1883); //for using local broker
+  //mqttClient.setServer("broker.hivemq.com",1883);
+  DEBUG(F("MQTT client configured"));
+  mqttClient.connect(CLIENT_ID, "domophone", "domophone");
+  // setup DHT sensor
+  //dht.begin();
+  previousMillis = millis();
+}
+void sendData() ;
+void loop() {
+  statusBD=digitalRead(4);
+  statusGD=digitalRead(5);
+  statusKD=digitalRead(6);
+  lichtstatus = analogRead(A0);
+  // check interval
+  if(millis() - previousMillis > INTERVAL) {
+    sendData();
+    previousMillis = millis();
+  }
+  mqttClient.loop();
+}
+
+void sendData() {
+  char msgBuffer[20] = "HELLO!!!!!";
+  float h=100;//dht.readHumidity();
+  float t = -100;//dht.readTemperature();
+  //if(mqttClient.connect(CLIENT_ID, "domophone", "domophone")) {
+   mqttClient.publish("hal/temp", dtostrf(t, 6, 2, msgBuffer));
+   mqttClient.publish("hal/humid", dtostrf(h, 6, 2, msgBuffer));
+   mqttClient.publish("hal/door", (statusBD == HIGH) ? "OPEN" : "DICHT");
+   mqttClient.publish("hal/garage",(statusGD == HIGH) ? "OPEN" : "DICHT");
+   mqttClient.publish("hal/kamer",(statusKD == HIGH) ? "OPEN" : "DICHT");
+   mqttClient.publish("hal/licht", dtostrf(lichtstatus, 4, 0, msgBuffer));
+
+
+   DEBUG("SEND");
+ //hal=hallway, DICHT=Closed, kamer=room, licht=light
+ //}
+}
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
 #include <WiFiEsp.h>
 #include <PubSubClient.h>
 #include <SoftwareSerial.h>
@@ -20,7 +416,7 @@ void setup()
 {
     Serial.begin(ESP_SERIAL_BOUDRATE);
     SerialDebug.begin(DEBUG_SERIAL_BOUDRATE);
-
+    pinMode(LED_CONECTION_MQTT, OUTPUT);
     pinMode(LED_CONNECTION_WIFI, OUTPUT);
     // Подключаемся к WiFi
     while (connect_wifi() != STATUS_OK);
@@ -43,20 +439,20 @@ void loop()
     MQTTClient.loop();
 
 
-    //long now = millis();
-    //if (now - lastMsg > 10000) {
-    //    lastMsg = now;
-    //    ++value;
-    //    snprintf (msg, 75, "#%ld - hello", value);
-    //    DEBUG("Publish message: ");
-    //    DEBUG(msg);
-    //    MQTTClient.publish("outTopic", msg, true);
-    //}
+    long now = millis();
+    if (now - lastMsg > 1000) {
+        lastMsg = now;
+        ++value;
+        snprintf (msg, 75, "#%ld - hello datahello datahello ", value);
+        DEBUG("Publish message: ");
+        //DEBUG(msg);
+        MQTTClient.publish("outTopic", msg, true);
+    }
 
 }
 
 
-
+*/
 /*
  WiFiEsp example: WebClient
  This sketch connects to google website using an ESP8266 module to
@@ -98,7 +494,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   for (int i = 0; i < length; i++) {
     Serial.print((char)payload[i]);
   }
-  Serial.println();
+  DEBUG();
 
   // Switch on the LED if an 1 was received as first character
   if ((char)payload[0] == '1') {
@@ -126,7 +522,7 @@ void setup()
 
   // check for the presence of the shield
   if (WiFi.status() == WL_NO_SHIELD) {
-    Serial.println("WiFi shield not present");
+    DEBUG("WiFi shield not present");
     // don't continue
     while (true);
   }
@@ -134,18 +530,18 @@ void setup()
   // attempt to connect to WiFi network
   while ( status != WL_CONNECTED) {
     Serial.print("Attempting to connect to WPA SSID: ");
-    Serial.println(WIFI_SSID);
+    DEBUG(WIFI_SSID);
     // Connect to WPA/WPA2 network
     status = WiFi.begin(WIFI_SSID, WIFI_PASS);
   }
 
   // you're connected now, so print out the data
-  Serial.println("You're connected to the network");
+  DEBUG("You're connected to the network");
 
   //printWifiStatus();
 
-  Serial.println();
-  Serial.println("Starting connection to server...");
+  DEBUG();
+  DEBUG("Starting connection to server...");
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
 }
@@ -159,18 +555,18 @@ void reconnect() {
     sprintf(client_id, "arduino-%d", random(0xffff));
 
     if (client.connect(client_id, "domophone", "domophone")) {
-      Serial.println("connected");
-      Serial.println(client_id);
+      DEBUG("connected");
+      DEBUG(client_id);
       // Once connected, publish an announcement...
       client.publish("/dm/status", "hello world", true);
       // ... and resubscribe
       client.subscribe("/dm/settings");
 
-      Serial.println("connect settings");
+      DEBUG("connect settings");
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
+      DEBUG(" try again in 5 seconds");
       // Wait 5 seconds before retrying
       delay(5000);
     }
@@ -195,7 +591,7 @@ void loop() {
     ++value;
     snprintf (msg, 75, "hello world #%ld", value);
     Serial.print("Publish message: ");
-    Serial.println(msg);
+    DEBUG(msg);
     client.publish("outTopic", msg, true);
   }
 
@@ -373,9 +769,9 @@ void setup_wifi() {
 
 delay(10);
 // We start by connecting to a WiFi network
-Serial.println();
+DEBUG();
 Serial.print("Connecting to ");
-Serial.println(ssid);
+DEBUG(ssid);
 
 WiFi.begin(ssid, password);
 
@@ -384,10 +780,10 @@ while (WiFi.status() != WL_CONNECTED) {
   Serial.print(".");
 }
 
-Serial.println("");
-Serial.println("WiFi connected");
-Serial.println("IP address: ");
-Serial.println(WiFi.localIP());
+DEBUG("");
+DEBUG("WiFi connected");
+DEBUG("IP address: ");
+DEBUG(WiFi.localIP());
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -397,7 +793,7 @@ Serial.print("] ");
 for (int i = 0; i < length; i++) {
   Serial.print((char)payload[i]);
 }
-Serial.println();
+DEBUG();
 
 // Switch on the LED if an 1 was received as first character
 if ((char)payload[0] == '1') {
@@ -416,7 +812,7 @@ while (!client.connected()) {
   Serial.print("Attempting MQTT connection...");
   // Attempt to connect
   if (client.connect("ESP8266Client")) {
-    Serial.println("connected");
+    DEBUG("connected");
     // Once connected, publish an announcement...
     client.publish("outTopic", "hello world");
     // ... and resubscribe
@@ -424,7 +820,7 @@ while (!client.connected()) {
   } else {
     Serial.print("failed, rc=");
     Serial.print(client.state());
-    Serial.println(" try again in 5 seconds");
+    DEBUG(" try again in 5 seconds");
     // Wait 5 seconds before retrying
     delay(5000);
   }
@@ -443,7 +839,7 @@ if (now - lastMsg > 2000) {
   ++value;
   snprintf (msg, 75, "hello world #%ld", value);
   Serial.print("Publish message: ");
-  Serial.println(msg);
+  DEBUG(msg);
   client.publish("outTopic", msg);
 }
 }

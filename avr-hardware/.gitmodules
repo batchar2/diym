@@ -1,3 +1,0 @@
-[submodule "lib/WiFiEsp"]
-	path = lib/WiFiEsp
-	url = https://github.com/bportaluri/WiFiEsp.git
